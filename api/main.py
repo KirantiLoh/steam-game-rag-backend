@@ -1,9 +1,8 @@
-"""Steam Game Recommender API — search, rerank, similar, image search."""
+"""Steam Game Recommender — ES-based hybrid search + cross-encoder reranker."""
 import asyncio
-import heapq
 import logging
 import time
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from io import BytesIO
 from typing import List, Optional
@@ -12,8 +11,7 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 from PIL import Image
 
-from text_retriever.retriever import SteamRetriever
-from image_retriever.retriever import ImageHNSWRetriever
+from es_retriever import ESRetriever
 from game_store import GameStore
 from reranker import Reranker
 
@@ -59,28 +57,26 @@ class SearchCache:
 
 
 search_cache = SearchCache()
-
-retriever: SteamRetriever = None
-image_retriever: ImageHNSWRetriever = None
+retriever: ESRetriever = None
 game_store: GameStore = None
 reranker: Reranker = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global retriever, image_retriever, game_store, reranker
-    logger.info("Loading models and indices...")
+    global retriever, game_store, reranker
+    logger.info("Loading models…")
     loop = asyncio.get_running_loop()
 
     def _load():
-        t = SteamRetriever(default_k=50)
-        i = ImageHNSWRetriever(default_k=50)
+        r = ESRetriever(default_k=50)
         g = GameStore()
-        r = Reranker()
-        return t, i, g, r
+        rn = Reranker()
+        logger.info("ES doc count: %d", r.es.count(index="steam_games")["count"])
+        return r, g, rn
 
-    retriever, image_retriever, game_store, reranker = await loop.run_in_executor(None, _load)
-    logger.info("All models loaded successfully")
+    retriever, game_store, reranker = await loop.run_in_executor(None, _load)
+    logger.info("All models loaded")
     yield
 
 
@@ -118,24 +114,7 @@ class SearchResponseOut(BaseModel):
 
 
 def _preprocess_query(raw: str) -> str:
-    q = raw.strip().lower()
-    return q
-
-
-def _fuse_results(
-    text_ranked: List[str],
-    image_ranked: List[str],
-    limit: int,
-    k: int = 60,
-    text_weight: float = 1.5,
-    image_weight: float = 1.0,
-) -> List:
-    scores: dict[str, float] = defaultdict(float)
-    for rank, doc_id in enumerate(text_ranked, start=1):
-        scores[doc_id] += text_weight / (k + rank)
-    for rank, doc_id in enumerate(image_ranked, start=1):
-        scores[doc_id] += image_weight / (k + rank)
-    return sorted(scores.items(), key=lambda x: x[1], reverse=True)[:limit]
+    return raw.strip().lower()
 
 
 def _enrich(app_id_score_pairs: list) -> list:
@@ -153,6 +132,7 @@ def _enrich(app_id_score_pairs: list) -> list:
 
 # ── Health ──────────────────────────────────────────────────────────
 
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -160,15 +140,15 @@ async def health():
 
 # ── Trending ───────────────────────────────────────────────────────
 
+
 @app.get("/api/trending", response_model=SearchResponseOut)
-async def trending(
-    limit: int = Query(12, ge=1, le=50),
-):
+async def trending(limit: int = Query(12, ge=1, le=50)):
     results = game_store.get_trending(limit)
     return SearchResponseOut(results=results, query="trending", total=len(results))
 
 
-# ── Text Search (with RRF + Reranker) ───────────────────────────────
+# ── Search (ES hybrid + optional reranker) ─────────────────────────
+
 
 @app.get("/api/search", response_model=SearchResponseOut)
 async def search(
@@ -184,26 +164,18 @@ async def search(
     if not query:
         return SearchResponseOut(results=[], query=q, total=0)
 
-    has_filters = genre is not None or platform is not None or price_min is not None or price_max is not None
-
     try:
         cache_key = f"s|{query}|{limit}|{rerank}|{genre}|{platform}|{price_min}|{price_max}"
         cached = search_cache.get(cache_key)
         if cached is not None:
             logger.info("Cache hit for query=%s", query)
-            enriched = _enrich(cached)
-            return SearchResponseOut(results=enriched, query=query, total=len(enriched))
+            return SearchResponseOut(results=_enrich(cached), query=query, total=len(cached))
 
-        text_results = await retriever.search(query, k=limit * 2)
+        fuse_k = limit * 2 if rerank else limit
         loop = asyncio.get_running_loop()
-        image_results = await loop.run_in_executor(
-            None, image_retriever.search_text, query, limit * 2
+        fused = await loop.run_in_executor(
+            None, retriever.search, query, fuse_k, genre, platform, price_min, price_max
         )
-
-        text_ranked = [r["app_id"] for r in text_results if r.get("app_id")]
-        image_ranked = [app_id for app_id, _ in image_results if app_id]
-
-        fused = _fuse_results(text_ranked, image_ranked, limit * 2 if rerank else limit)
 
         if rerank and fused:
             candidates = []
@@ -217,31 +189,14 @@ async def search(
                 combined = f"{name}\n\n{short_desc}\n\n{desc}" if short_desc else f"{name}\n\n{desc}"
                 candidates.append((app_id, combined))
 
-            loop = asyncio.get_running_loop()
             reranked = await loop.run_in_executor(
-                None, reranker.rerank, query, candidates, limit * 2
+                None, reranker.rerank, query, candidates, limit
             )
             scored = reranked
         else:
             scored = fused
 
         enriched = _enrich(scored)
-
-        if has_filters and enriched:
-            filtered = []
-            for item in enriched:
-                g = item["game"]
-                if genre and genre.lower() not in [x.lower() for x in g.get("genres", [])]:
-                    continue
-                if platform and platform.lower() not in [x.lower() for x in g.get("platforms", [])]:
-                    continue
-                if price_min is not None and g.get("price", 0) < price_min:
-                    continue
-                if price_max is not None and g.get("price", 0) > price_max:
-                    continue
-                filtered.append(item)
-            enriched = filtered[:limit]
-
         search_cache.set(cache_key, scored)
         return SearchResponseOut(results=enriched, query=query, total=len(enriched))
     except HTTPException:
@@ -253,6 +208,7 @@ async def search(
 
 # ── Image Search ────────────────────────────────────────────────────
 
+
 @app.post("/api/search/image", response_model=SearchResponseOut)
 async def search_by_image(
     file: UploadFile = File(...),
@@ -261,20 +217,19 @@ async def search_by_image(
     try:
         contents = await file.read()
         image = Image.open(BytesIO(contents)).convert("RGB")
-
         loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(
-            None, image_retriever.search_image, image, limit
-        )
+        results = await loop.run_in_executor(None, retriever.search_image, image, limit)
         enriched = _enrich(results)
-        query = f"image search: {file.filename or 'uploaded image'}"
-        return SearchResponseOut(results=enriched, query=query, total=len(enriched))
-    except Exception as e:
+        return SearchResponseOut(
+            results=enriched, query=f"image search: {file.filename or 'uploaded image'}", total=len(enriched)
+        )
+    except Exception:
         logger.exception("Image search failed")
         raise HTTPException(status_code=500, detail="Image search failed")
 
 
 # ── Game Detail ─────────────────────────────────────────────────────
+
 
 @app.get("/api/games/{game_id}", response_model=GameOut)
 async def get_game(game_id: int):
@@ -285,12 +240,13 @@ async def get_game(game_id: int):
         return game
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         logger.exception("Game lookup failed")
         raise HTTPException(status_code=500, detail="Game lookup failed")
 
 
 # ── Similar Games ────────────────────────────────────────────────────
+
 
 @app.get("/api/games/{game_id}/similar", response_model=SearchResponseOut)
 async def similar_games(
@@ -302,20 +258,14 @@ async def similar_games(
         app_id = str(game_id)
         loop = asyncio.get_running_loop()
         results = await loop.run_in_executor(
-            None, image_retriever.search_similar, app_id, limit * 2 if rerank else limit
+            None, retriever.search_similar, app_id, limit * 2 if rerank else limit
         )
         if not results:
-            return SearchResponseOut(
-                results=[], query=f"similar to {game_id}", total=0
-            )
+            return SearchResponseOut(results=[], query=f"similar to {game_id}", total=0)
 
-        if rerank and results:
+        if rerank:
             source_game = game_store.get_game_by_app_id(app_id)
-            query_desc = ""
-            if source_game:
-                query_desc = (
-                    f"{source_game.get('name', '')}\n\n"
-                )
+            query_desc = f"{source_game.get('name', '')}\n\n" if source_game else ""
 
             candidates = []
             for candidate_app_id, _ in results:
@@ -338,6 +288,6 @@ async def similar_games(
         return SearchResponseOut(
             results=enriched, query=f"similar to {game_id}", total=len(enriched)
         )
-    except Exception as e:
+    except Exception:
         logger.exception("Similar games failed")
         raise HTTPException(status_code=500, detail="Similar games lookup failed")

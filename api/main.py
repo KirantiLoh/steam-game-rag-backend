@@ -2,7 +2,8 @@
 import asyncio
 import heapq
 import logging
-from collections import defaultdict
+import time
+from collections import OrderedDict, defaultdict
 from contextlib import asynccontextmanager
 from io import BytesIO
 from typing import List, Optional
@@ -17,6 +18,47 @@ from game_store import GameStore
 from reranker import Reranker
 
 logger = logging.getLogger("steamrec")
+
+
+class SearchCache:
+    def __init__(self, maxsize: int = 128, ttl: int = 300):
+        self._cache: OrderedDict = OrderedDict()
+        self._timestamps: dict[str, float] = {}
+        self.maxsize = maxsize
+        self.ttl = ttl
+
+    def get(self, key: str):
+        entry = self._cache.get(key)
+        if entry is None:
+            return None
+        if time.time() - self._timestamps[key] > self.ttl:
+            self._cache.pop(key, None)
+            self._timestamps.pop(key, None)
+            return None
+        self._cache.move_to_end(key)
+        return entry
+
+    def set(self, key: str, value):
+        self._cache[key] = value
+        self._timestamps[key] = time.time()
+        self._cache.move_to_end(key)
+        while len(self._cache) > self.maxsize:
+            oldest = next(iter(self._cache))
+            self._cache.pop(oldest)
+            self._timestamps.pop(oldest, None)
+
+    def invalidate(self, prefix: Optional[str] = None):
+        if prefix:
+            keys = [k for k in self._cache if k.startswith(prefix)]
+            for k in keys:
+                self._cache.pop(k, None)
+                self._timestamps.pop(k, None)
+        else:
+            self._cache.clear()
+            self._timestamps.clear()
+
+
+search_cache = SearchCache()
 
 retriever: SteamRetriever = None
 image_retriever: ImageHNSWRetriever = None
@@ -75,17 +117,24 @@ class SearchResponseOut(BaseModel):
     total: int
 
 
+def _preprocess_query(raw: str) -> str:
+    q = raw.strip().lower()
+    return q
+
+
 def _fuse_results(
     text_ranked: List[str],
     image_ranked: List[str],
     limit: int,
+    k: int = 60,
+    text_weight: float = 1.5,
+    image_weight: float = 1.0,
 ) -> List:
     scores: dict[str, float] = defaultdict(float)
-    for rank_list in [text_ranked, image_ranked]:
-        for rank, doc_id in enumerate(rank_list, start=1):
-            scores[doc_id] += 1.0 / (60 + rank)
-    if limit < len(scores) * 0.3:
-        return heapq.nlargest(limit, scores.items(), key=lambda x: x[1])
+    for rank, doc_id in enumerate(text_ranked, start=1):
+        scores[doc_id] += text_weight / (k + rank)
+    for rank, doc_id in enumerate(image_ranked, start=1):
+        scores[doc_id] += image_weight / (k + rank)
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)[:limit]
 
 
@@ -126,12 +175,25 @@ async def search(
     q: str = Query("", min_length=0, max_length=200),
     limit: int = Query(20, ge=1, le=100),
     rerank: bool = Query(True, description="Apply cross-encoder reranking"),
+    genre: Optional[str] = Query(None, description="Filter by genre"),
+    platform: Optional[str] = Query(None, description="Filter by platform (Windows, Mac, Linux)"),
+    price_min: Optional[float] = Query(None, ge=0, description="Minimum price"),
+    price_max: Optional[float] = Query(None, ge=0, description="Maximum price"),
 ):
-    query = q.strip()
+    query = _preprocess_query(q)
     if not query:
         return SearchResponseOut(results=[], query=q, total=0)
 
+    has_filters = genre is not None or platform is not None or price_min is not None or price_max is not None
+
     try:
+        cache_key = f"s|{query}|{limit}|{rerank}|{genre}|{platform}|{price_min}|{price_max}"
+        cached = search_cache.get(cache_key)
+        if cached is not None:
+            logger.info("Cache hit for query=%s", query)
+            enriched = _enrich(cached)
+            return SearchResponseOut(results=enriched, query=query, total=len(enriched))
+
         text_results = await retriever.search(query, k=limit * 2)
         loop = asyncio.get_running_loop()
         image_results = await loop.run_in_executor(
@@ -149,17 +211,38 @@ async def search(
                 game = game_store.get_game_by_app_id(app_id)
                 if game is None:
                     continue
-                desc = game.get("description", "") or game.get("short_description", "") or game.get("name", "")
-                candidates.append((app_id, desc))
+                name = game.get("name", "")
+                short_desc = game.get("short_description", "")
+                desc = game.get("description", "")
+                combined = f"{name}\n\n{short_desc}\n\n{desc}" if short_desc else f"{name}\n\n{desc}"
+                candidates.append((app_id, combined))
 
             loop = asyncio.get_running_loop()
             reranked = await loop.run_in_executor(
-                None, reranker.rerank, query, candidates, limit
+                None, reranker.rerank, query, candidates, limit * 2
             )
-            enriched = _enrich(reranked)
+            scored = reranked
         else:
-            enriched = _enrich(fused)
+            scored = fused
 
+        enriched = _enrich(scored)
+
+        if has_filters and enriched:
+            filtered = []
+            for item in enriched:
+                g = item["game"]
+                if genre and genre.lower() not in [x.lower() for x in g.get("genres", [])]:
+                    continue
+                if platform and platform.lower() not in [x.lower() for x in g.get("platforms", [])]:
+                    continue
+                if price_min is not None and g.get("price", 0) < price_min:
+                    continue
+                if price_max is not None and g.get("price", 0) > price_max:
+                    continue
+                filtered.append(item)
+            enriched = filtered[:limit]
+
+        search_cache.set(cache_key, scored)
         return SearchResponseOut(results=enriched, query=query, total=len(enriched))
     except HTTPException:
         raise
@@ -213,18 +296,45 @@ async def get_game(game_id: int):
 async def similar_games(
     game_id: int,
     limit: int = Query(8, ge=1, le=50),
+    rerank: bool = Query(False, description="Apply cross-encoder reranking"),
 ):
     try:
         app_id = str(game_id)
         loop = asyncio.get_running_loop()
         results = await loop.run_in_executor(
-            None, image_retriever.search_similar, app_id, limit
+            None, image_retriever.search_similar, app_id, limit * 2 if rerank else limit
         )
         if not results:
             return SearchResponseOut(
                 results=[], query=f"similar to {game_id}", total=0
             )
-        enriched = _enrich(results)
+
+        if rerank and results:
+            source_game = game_store.get_game_by_app_id(app_id)
+            query_desc = ""
+            if source_game:
+                query_desc = (
+                    f"{source_game.get('name', '')}\n\n"
+                )
+
+            candidates = []
+            for candidate_app_id, _ in results:
+                game = game_store.get_game_by_app_id(candidate_app_id)
+                if game is None:
+                    continue
+                name = game.get("name", "")
+                short_desc = game.get("short_description", "")
+                desc = game.get("description", "")
+                combined = f"{name}\n\n{short_desc}\n\n{desc}" if short_desc else f"{name}\n\n{desc}"
+                candidates.append((candidate_app_id, combined))
+
+            reranked = await loop.run_in_executor(
+                None, reranker.rerank, query_desc, candidates, limit
+            )
+            enriched = _enrich(reranked)
+        else:
+            enriched = _enrich(results)
+
         return SearchResponseOut(
             results=enriched, query=f"similar to {game_id}", total=len(enriched)
         )

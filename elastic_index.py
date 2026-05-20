@@ -1,6 +1,7 @@
 """Elasticsearch indexing: parquet metadata + CLIP vectors."""
 import os
 import logging
+import sys
 from typing import Any
 
 import faiss
@@ -9,7 +10,7 @@ import pandas as pd
 from elasticsearch import Elasticsearch, helpers
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ES_URL = "http://localhost:9200"
+ES_URL = os.environ.get("ES_URL", "http://localhost:9200")
 INDEX_NAME = "steam_games"
 BATCH_SIZE = 500
 
@@ -160,5 +161,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import sys
     main()

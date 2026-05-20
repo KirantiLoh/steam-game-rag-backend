@@ -1,6 +1,7 @@
 """Elasticsearch-based hybrid retriever for Steam games."""
 import asyncio
 import logging
+import os
 from collections import defaultdict
 from io import BytesIO
 from typing import Any, Optional
@@ -14,7 +15,7 @@ from sentence_transformers import SentenceTransformer
 logger = logging.getLogger("steamrec")
 
 INDEX_NAME = "steam_games"
-ES_URL = "http://localhost:9200"
+ES_URL = os.environ.get("ES_URL", "http://localhost:9200")
 RRF_K = 60
 TEXT_WEIGHT = 1.5
 IMAGE_WEIGHT = 1.0

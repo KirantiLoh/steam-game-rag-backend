@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+
+index/data/
+index/faiss_index/
+index/metadata.parquet
+index/steam_games.index
+index/steam_games_bm25_index/
+
+*.log
+*.err
+
+compose.yml

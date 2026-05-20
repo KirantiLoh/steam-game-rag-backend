@@ -14,6 +14,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir -r requirements.txt
 
+# Pre-download HF models at build time (avoids runtime download)
+ARG HF_TOKEN
+RUN HF_TOKEN=$HF_TOKEN python -c "from sentence_transformers import CrossEncoder; CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', max_length=512, device='cpu')"
+RUN HF_TOKEN=$HF_TOKEN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('clip-ViT-B-32', device='cpu')"
+
 COPY api/ api/
 COPY es_retriever.py game_store.py reranker.py elastic_index.py ./
 COPY index/data/train-00000-of-00001.parquet index/data/

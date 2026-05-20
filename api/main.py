@@ -8,6 +8,7 @@ from io import BytesIO
 from typing import List, Optional
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from PIL import Image
 
@@ -81,6 +82,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="SteamRec API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class GameOut(BaseModel):

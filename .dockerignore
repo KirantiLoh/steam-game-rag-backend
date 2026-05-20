@@ -6,6 +6,4 @@ __pycache__
 *.err
 index/faiss_index
 index/steam_games_bm25_index
-index/steam_games.index
-index/metadata.parquet
 .DS_Store

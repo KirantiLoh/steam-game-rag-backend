@@ -29,3 +29,11 @@ services:
       - ES_URL=http://elasticsearch:9200
     ports:
       - "8000:8000"
+
+  frontend:
+    build: ../frontend
+    container_name: steamrec-frontend
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"

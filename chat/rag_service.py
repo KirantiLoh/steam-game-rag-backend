@@ -83,11 +83,41 @@ class RAGService:
 
         return "\n".join(parts)
 
+    def _merge_multimodal_results(
+        self,
+        text_results: List[tuple],
+        image_results: List[tuple],
+        limit: int
+    ) -> List[tuple]:
+        """Merge text and image results using weighted RRF."""
+        from collections import defaultdict
+
+        RRF_K = 60
+        TEXT_WEIGHT = 1.5  # Prefer text intent
+        IMAGE_WEIGHT = 1.0
+
+        scores = defaultdict(float)
+
+        for rank, (app_id, _) in enumerate(text_results, start=1):
+            scores[app_id] += TEXT_WEIGHT / (RRF_K + rank)
+
+        for rank, (app_id, _) in enumerate(image_results, start=1):
+            scores[app_id] += IMAGE_WEIGHT / (RRF_K + rank)
+
+        merged = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:limit]
+
+        logger.info(
+            f"Merged {len(text_results)} text + {len(image_results)} image → {len(merged)} final"
+        )
+
+        return merged
+
     async def retrieve_context(
         self,
         query: str,
         filters: Optional[Dict] = None,
-        rerank: bool = True
+        rerank: bool = True,
+        image = None
     ) -> tuple[List[Dict], str]:
         """
         Retrieve and format game context for RAG.
@@ -96,6 +126,7 @@ class RAGService:
             query: User search query
             filters: Optional filters (genre, platform, price_min, price_max)
             rerank: Whether to apply cross-encoder reranking
+            image: Optional PIL Image for multimodal search
 
         Returns:
             tuple: (list of game dicts, formatted context string)
@@ -111,14 +142,53 @@ class RAGService:
 
         # Run retrieval in executor (blocking operation)
         loop = asyncio.get_event_loop()
-        candidates = await loop.run_in_executor(
-            None,
-            lambda: self.retriever.search(
-                query, k=retrieve_k,
-                genre=genre, platform=platform,
-                price_min=price_min, price_max=price_max
+
+        # Detect meta-queries about the image itself
+        meta_query_keywords = ["what is this", "identify this", "what game is this", "which game", "name this game", "recognize this"]
+        is_meta_query = image is not None and query.strip() and any(keyword in query.lower() for keyword in meta_query_keywords)
+
+        # Branch based on input modality
+        if image is not None and query.strip() and not is_meta_query:
+            # ── HYBRID: Text + Image ──
+            logger.info("Multimodal search: text + image")
+
+            text_candidates = await loop.run_in_executor(
+                None,
+                lambda: self.retriever.search(
+                    query, k=retrieve_k,
+                    genre=genre, platform=platform,
+                    price_min=price_min, price_max=price_max
+                )
             )
-        )
+
+            image_candidates = await loop.run_in_executor(
+                None,
+                lambda: self.retriever.search_image(image, k=retrieve_k)
+            )
+
+            candidates = self._merge_multimodal_results(
+                text_candidates, image_candidates, retrieve_k
+            )
+
+        elif image is not None:
+            # ── IMAGE-ONLY (or meta-query about the image) ──
+            logger.info("Image-only search" + (" (meta-query detected)" if is_meta_query else ""))
+            candidates = await loop.run_in_executor(
+                None,
+                lambda: self.retriever.search_image(image, k=retrieve_k)
+            )
+
+        else:
+            # ── TEXT-ONLY (default/backward compatible) ──
+            logger.info("Text-only search")
+            candidates = await loop.run_in_executor(
+                None,
+                lambda: self.retriever.search(
+                    query, k=retrieve_k,
+                    genre=genre, platform=platform,
+                    price_min=price_min, price_max=price_max
+                )
+            )
 
         if not candidates:
             return [], "No games found matching the criteria."
@@ -156,11 +226,21 @@ class RAGService:
             games = [g for g in games if g is not None]
 
         # Format context for LLM
-        context_parts = [
+        context_parts = []
+
+        # Add image search indicator
+        if image is not None:
+            context_parts.append("# Image Search Results\n")
+            if is_meta_query or not query.strip():
+                context_parts.append("The user uploaded a game screenshot/image. The following games are ranked by visual similarity. **The top result (Game 1) is most likely the game shown in the image.** Identify Game 1 as the game from the image and explain what you know about it.\n\n")
+            else:
+                context_parts.append("The user uploaded an image along with their query. The following games were retrieved based on visual similarity to the uploaded image AND text relevance.\n\n")
+
+        context_parts.extend([
             "# Available Games (Retrieved from Database)\n",
             "Use these games to provide personalized recommendations.\n",
             "Always cite games using the format: **[Game Name](game_id)**\n\n"
-        ]
+        ])
 
         for i, game in enumerate(games, 1):
             context_parts.append(f"## Game {i}\n")

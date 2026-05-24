@@ -3,7 +3,7 @@ import logging
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Form, File, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -20,18 +20,6 @@ llm_client = None
 session_manager = None
 
 
-# Extended ChatRequest with filters
-class ChatRequestExtended(BaseModel):
-    """Chat request with optional filters."""
-    query: str = Field(..., min_length=1, max_length=500, description="User query")
-    session_id: Optional[str] = Field(None, description="Session ID for conversation continuity")
-    genre: Optional[str] = Field(None, description="Filter by genre")
-    platform: Optional[str] = Field(None, description="Filter by platform (Windows, Mac, Linux)")
-    price_min: Optional[float] = Field(None, ge=0, description="Minimum price")
-    price_max: Optional[float] = Field(None, ge=0, description="Maximum price")
-    stream: bool = Field(default=True, description="Enable streaming response (SSE)")
-
-
 # Extended ChatResponse with metadata
 class ChatResponseExtended(BaseModel):
     """Chat response with metadata."""
@@ -41,7 +29,16 @@ class ChatResponseExtended(BaseModel):
 
 
 @router.post("", response_model=None)
-async def chat_assistant(request: ChatRequestExtended):
+async def chat_assistant(
+    query: str = Form(..., min_length=1, max_length=500),
+    session_id: Optional[str] = Form(None),
+    genre: Optional[str] = Form(None),
+    platform: Optional[str] = Form(None),
+    price_min: Optional[float] = Form(None),
+    price_max: Optional[float] = Form(None),
+    stream: bool = Form(True),
+    image: Optional[UploadFile] = File(None),
+):
     """
     Conversational game recommendation assistant with RAG.
 
@@ -67,40 +64,56 @@ async def chat_assistant(request: ChatRequestExtended):
 
     try:
         # Generate or validate session ID
-        session_id = request.session_id or str(uuid.uuid4())
+        session_id_value = session_id or str(uuid.uuid4())
 
         # Get conversation history
-        history = session_manager.get_history(session_id)
+        history = session_manager.get_history(session_id_value)
+
+        # Process optional image upload
+        image_obj = None
+        if image is not None:
+            try:
+                from PIL import Image
+                from io import BytesIO
+                contents = await image.read()
+                image_obj = Image.open(BytesIO(contents)).convert("RGB")
+                logger.info(f"Image uploaded: {image.filename}, size={image_obj.size}")
+            except Exception as e:
+                logger.warning(f"Image processing failed: {e}")
+                # Continue without image rather than failing entire request
+                image_obj = None
 
         # Build filters
         filters = {}
-        if request.genre:
-            filters["genre"] = request.genre
-        if request.platform:
-            filters["platform"] = request.platform
-        if request.price_min is not None:
-            filters["price_min"] = request.price_min
-        if request.price_max is not None:
-            filters["price_max"] = request.price_max
+        if genre:
+            filters["genre"] = genre
+        if platform:
+            filters["platform"] = platform
+        if price_min is not None:
+            filters["price_min"] = price_min
+        if price_max is not None:
+            filters["price_max"] = price_max
 
-        # Retrieve RAG context
+        # Retrieve RAG context (with optional image)
         games, context = await rag_service.retrieve_context(
-            query=request.query,
+            query=query,
             filters=filters if filters else None,
-            rerank=settings.rag_rerank
+            rerank=settings.rag_rerank,
+            image=image_obj
         )
 
-        # Add user message to history
-        session_manager.add_message(session_id, "user", request.query)
+        # Add user message to history with image indicator
+        query_with_meta = query if image_obj is None else f"{query} [+image]"
+        session_manager.add_message(session_id_value, "user", query_with_meta)
 
-        if request.stream:
+        if stream:
             # ── STREAMING RESPONSE (SSE) ──
             async def event_stream():
                 """Generate Server-Sent Events stream."""
                 accumulated_response = []
 
                 # Send session ID
-                yield f"event: session\ndata: {session_id}\n\n"
+                yield f"event: session\ndata: {session_id_value}\n\n"
 
                 # Send metadata
                 yield f"event: metadata\ndata: {len(games)}\n\n"
@@ -108,7 +121,7 @@ async def chat_assistant(request: ChatRequestExtended):
                 # Stream LLM tokens
                 try:
                     async for token in llm_client.stream_chat(
-                        request.query, context, history
+                        query, context, history
                     ):
                         accumulated_response.append(token)
                         # Escape newlines in SSE data
@@ -117,7 +130,7 @@ async def chat_assistant(request: ChatRequestExtended):
 
                     # Save complete response to history
                     full_response = "".join(accumulated_response)
-                    session_manager.add_message(session_id, "assistant", full_response)
+                    session_manager.add_message(session_id_value, "assistant", full_response)
 
                     # Send completion event
                     yield f"event: done\ndata: success\n\n"
@@ -140,15 +153,15 @@ async def chat_assistant(request: ChatRequestExtended):
         else:
             # ── NON-STREAMING RESPONSE ──
             response_text = await llm_client.get_full_response(
-                request.query, context, history
+                query, context, history
             )
 
             # Save to history
-            session_manager.add_message(session_id, "assistant", response_text)
+            session_manager.add_message(session_id_value, "assistant", response_text)
 
             return ChatResponseExtended(
                 response=response_text,
-                session_id=session_id,
+                session_id=session_id_value,
                 games_retrieved=len(games)
             )
 

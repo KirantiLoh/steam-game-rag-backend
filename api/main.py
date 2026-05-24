@@ -187,25 +187,40 @@ async def search(
         )
 
         if rerank and fused:
+            # Batch fetch all games once to avoid N+1 lookups
+            app_ids = [app_id for app_id, _ in fused]
+            games_cache = {k: v for k, v in game_store.get_games_batch(app_ids).items() if v is not None}
+
+            # Prepare candidates with optimized text formatting
             candidates = []
             for app_id, _ in fused:
-                game = game_store.get_game_by_app_id(app_id)
+                game = games_cache.get(app_id)
                 if game is None:
                     continue
-                name = game.get("name", "")
-                short_desc = game.get("short_description", "")
-                desc = game.get("description", "")
-                combined = f"{name}\n\n{short_desc}\n\n{desc}" if short_desc else f"{name}\n\n{desc}"
+                # Use reranker's smart text preparation for optimal token usage
+                combined = reranker.prepare_text(
+                    game.get("name", ""),
+                    game.get("short_description", ""),
+                    game.get("description", "")
+                )
                 candidates.append((app_id, combined))
 
             reranked = await loop.run_in_executor(
                 None, reranker.rerank, query, candidates, limit
             )
             scored = reranked
+
+            # Reuse cached games for enrichment (avoid duplicate lookups)
+            seen = set()
+            enriched = []
+            for app_id, score in scored:
+                if app_id in seen or app_id not in games_cache:
+                    continue
+                seen.add(app_id)
+                enriched.append({"game": games_cache[app_id], "score": round(float(score), 4)})
         else:
             scored = fused
-
-        enriched = _enrich(scored)
+            enriched = _enrich(scored)
         search_cache.set(cache_key, scored)
         return SearchResponseOut(results=enriched, query=query, total=len(enriched))
     except HTTPException:
@@ -276,21 +291,36 @@ async def similar_games(
             source_game = game_store.get_game_by_app_id(app_id)
             query_desc = f"{source_game.get('name', '')}\n\n" if source_game else ""
 
+            # Batch fetch all candidate games to avoid N+1 lookups
+            candidate_ids = [candidate_app_id for candidate_app_id, _ in results]
+            games_cache = {k: v for k, v in game_store.get_games_batch(candidate_ids).items() if v is not None}
+
+            # Prepare candidates with optimized text formatting
             candidates = []
             for candidate_app_id, _ in results:
-                game = game_store.get_game_by_app_id(candidate_app_id)
+                game = games_cache.get(candidate_app_id)
                 if game is None:
                     continue
-                name = game.get("name", "")
-                short_desc = game.get("short_description", "")
-                desc = game.get("description", "")
-                combined = f"{name}\n\n{short_desc}\n\n{desc}" if short_desc else f"{name}\n\n{desc}"
+                # Use reranker's smart text preparation
+                combined = reranker.prepare_text(
+                    game.get("name", ""),
+                    game.get("short_description", ""),
+                    game.get("description", "")
+                )
                 candidates.append((candidate_app_id, combined))
 
             reranked = await loop.run_in_executor(
                 None, reranker.rerank, query_desc, candidates, limit
             )
-            enriched = _enrich(reranked)
+
+            # Reuse cached games for enrichment
+            seen = set()
+            enriched = []
+            for candidate_app_id, score in reranked:
+                if candidate_app_id in seen or candidate_app_id not in games_cache:
+                    continue
+                seen.add(candidate_app_id)
+                enriched.append({"game": games_cache[candidate_app_id], "score": round(float(score), 4)})
         else:
             enriched = _enrich(results)
 

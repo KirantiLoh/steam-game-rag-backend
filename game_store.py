@@ -59,6 +59,18 @@ class GameStore:
     def get_game(self, game_id: int) -> Optional[dict]:
         return self._store.get(str(game_id))
 
+    def get_games_batch(self, app_ids: list[str]) -> dict[str, Optional[dict]]:
+        """
+        Batch fetch multiple games by app_id.
+
+        Args:
+            app_ids: List of app_id strings
+
+        Returns:
+            Dictionary mapping app_id -> game dict (or None if not found)
+        """
+        return {app_id: self._store.get(app_id) for app_id in app_ids}
+
     def get_trending(self, n: int = 12) -> list:
         scored = [
             (app_id, g.get("positive_reviews", 0) + g.get("metacritic_score", 0) * 100)

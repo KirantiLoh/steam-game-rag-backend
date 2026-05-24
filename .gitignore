@@ -11,3 +11,4 @@ index/steam_games_bm25_index/
 *.err
 
 compose.yml
+*.env*

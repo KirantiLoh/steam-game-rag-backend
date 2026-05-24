@@ -13,11 +13,13 @@ class Reranker:
         model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
         device: Optional[str] = None,
         default_k: int = 10,
-        batch_size: int = 64,
+        batch_size: int = 32,
         max_length: int = 512,
     ):
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info("Loading reranker %s on %s (batch_size=%d)", model_name, self.device, batch_size)
+        self.device = device or (
+            "cuda" if torch.cuda.is_available() else "cpu")
+        logger.info("Loading reranker %s on %s (batch_size=%d)",
+                    model_name, self.device, batch_size)
         self.model = CrossEncoder(
             model_name,
             device=self.device,
@@ -121,7 +123,8 @@ class Reranker:
             pairs.append((query_truncated, text))
 
         # Batch inference with optimized batch size
-        scores = self.model.predict(pairs, show_progress_bar=False, batch_size=self.batch_size)
+        scores = self.model.predict(
+            pairs, show_progress_bar=False, batch_size=self.batch_size)
 
         # Combine app_ids with scores
         scored = []

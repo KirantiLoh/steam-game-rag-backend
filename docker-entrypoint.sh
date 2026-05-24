@@ -12,7 +12,7 @@ DOC_COUNT=$(curl -s "$ES_URL/steam_games/_count" 2>/dev/null | python -c "import
 
 if [ "$DOC_COUNT" -lt "1000" ]; then
   echo "Index steam_games empty ($DOC_COUNT docs). Running indexer..."
-  python elastic_index.py
+  python scripts/elastic_index.py
   echo "Indexing complete"
 else
   echo "Index steam_games has $DOC_COUNT docs — skipping indexing"

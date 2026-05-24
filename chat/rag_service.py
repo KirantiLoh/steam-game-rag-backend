@@ -3,9 +3,9 @@ import asyncio
 import logging
 from typing import List, Dict, Optional
 
-from es_retriever import ESRetriever
-from game_store import GameStore
-from reranker import Reranker
+from search.es_retriever import ESRetriever
+from search.game_store import GameStore
+from search.reranker import Reranker
 
 logger = logging.getLogger("steamrec")
 

@@ -19,9 +19,13 @@ ARG HF_TOKEN
 RUN HF_TOKEN=$HF_TOKEN python -c "from sentence_transformers import CrossEncoder; CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', max_length=512, device='cpu')"
 RUN HF_TOKEN=$HF_TOKEN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('clip-ViT-B-32', device='cpu')"
 
+# Copy application code (feature-driven structure)
+COPY main.py ./
 COPY api/ api/
-COPY es_retriever.py game_store.py reranker.py elastic_index.py ./
-COPY llm_config.py session_manager.py rag_service.py llm_client.py rate_limiter.py ./
+COPY search/ search/
+COPY chat/ chat/
+COPY core/ core/
+COPY scripts/ scripts/
 
 # Download game metadata + FAISS index from HF at build time
 RUN mkdir -p index/data && \

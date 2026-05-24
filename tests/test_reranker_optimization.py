@@ -1,5 +1,5 @@
 """Test script to validate reranker optimization changes."""
-from reranker import Reranker
+from search.reranker import Reranker
 
 
 def test_prepare_text():

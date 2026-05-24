@@ -29,6 +29,7 @@ class LLMSettings(BaseSettings):
     class Config:
         env_file = ".env"
         env_prefix = "LLM_"
+        extra = "ignore"
 
 
 settings = LLMSettings()

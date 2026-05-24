@@ -4,7 +4,8 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# File is now in search/ directory, so go up one level to reach root
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _to_list(val):

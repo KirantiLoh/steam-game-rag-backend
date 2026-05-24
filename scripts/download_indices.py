@@ -2,7 +2,8 @@
 import os
 from huggingface_hub import hf_hub_download, snapshot_download
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Script is now in scripts/ directory, so go up one level to reach root
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INDEX_DIR = os.path.join(BASE_DIR, "index")
 FAISS_DIR = os.path.join(INDEX_DIR, "faiss_index")
 os.makedirs(FAISS_DIR, exist_ok=True)

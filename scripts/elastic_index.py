@@ -9,7 +9,8 @@ import numpy as np
 import pandas as pd
 from elasticsearch import Elasticsearch, helpers
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Script is now in scripts/ directory, so go up one level to reach root
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ES_URL = os.environ.get("ES_URL", "http://localhost:9200")
 INDEX_NAME = "steam_games"
 BATCH_SIZE = 500

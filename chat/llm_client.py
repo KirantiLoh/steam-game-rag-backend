@@ -5,7 +5,7 @@ from typing import AsyncGenerator, List, Dict, Optional
 from google import genai
 from google.genai import types
 
-from llm_config import settings
+from core.config import settings
 
 logger = logging.getLogger("steamrec")
 
